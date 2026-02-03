@@ -17,24 +17,31 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState('');
   const [isLoading, setIsLoading] = useState(true);
 
+  // State Utama
   const [waitingList, setWaitingList] = useState([]);
-  const [activeSlots, setActiveSlots] = useState(
-    () =>
-      JSON.parse(localStorage.getItem('activeSlots')) || [
-        null,
-        null,
-        null,
-        null,
-      ],
-  );
+  const [activeSlots, setActiveSlots] = useState([null, null, null, null]);
   const [finishedStudents, setFinishedStudents] = useState(
     () => JSON.parse(localStorage.getItem('finishedStudents')) || [],
   );
-  const [timerStates, setTimerStates] = useState(
-    () => JSON.parse(localStorage.getItem('timerStates')) || {},
-  );
+  const [timerStates, setTimerStates] = useState({});
 
-  // 1. Ambil Data Siswa dari Supabase
+  // --- Ambil Data dari Supabase ---
+
+  const fetchActiveSlots = useCallback(async () => {
+    const { data, error } = await supabase
+      .from('active_slots')
+      .select('id, student_id, students(*)')
+      .order('id', { ascending: true });
+
+    if (!error && data) {
+      const slots = [null, null, null, null];
+      data.forEach((item) => {
+        if (item.student_id) slots[item.id] = item.students;
+      });
+      setActiveSlots(slots);
+    }
+  }, []);
+
   const fetchStudents = useCallback(async () => {
     try {
       setIsLoading(true);
@@ -42,86 +49,68 @@ export default function App() {
         .from('students')
         .select('*')
         .order('name', { ascending: true });
-
       if (error) throw error;
 
       const activeIds = activeSlots.filter((s) => s !== null).map((s) => s.id);
       const finishedIds = finishedStudents.map((s) => s.id);
-
       const filteredWaiting = data.filter(
         (s) => !activeIds.includes(s.id) && !finishedIds.includes(s.id),
       );
 
       setWaitingList(filteredWaiting);
-    } catch (error) {
-      console.error('Gagal memuat data Supabase:', error.message);
+    } catch (err) {
+      console.error(err.message);
     } finally {
       setIsLoading(false);
     }
   }, [activeSlots, finishedStudents]);
 
-  // 2. Sinkronisasi Real-time Antar Perangkat via Supabase
-  useEffect(() => {
-    fetchStudents();
+  const fetchTimerLogs = useCallback(async () => {
+    const { data } = await supabase.from('timer_logs').select('*');
+    if (data) {
+      const logs = {};
+      data.forEach((log) => {
+        logs[log.id] = {
+          isRunning: log.is_running,
+          startTime: log.start_time,
+          baseTime: log.base_time,
+        };
+      });
+      setTimerStates(logs);
+    }
+  }, []);
 
-    // Berlangganan perubahan pada tabel timer_logs di Supabase
+  // --- Real-time Sync ---
+  useEffect(() => {
+    fetchActiveSlots();
+    fetchStudents();
+    fetchTimerLogs();
+
     const channel = supabase
-      .channel('realtime-timer')
+      .channel('app-sync')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'active_slots' },
+        fetchActiveSlots,
+      )
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'timer_logs' },
-        (payload) => {
-          const { id, is_running, start_time, base_time } = payload.new;
-          setTimerStates((prev) => ({
-            ...prev,
-            [id]: {
-              isRunning: is_running,
-              startTime: start_time,
-              baseTime: base_time,
-            },
-          }));
-        },
+        fetchTimerLogs,
       )
       .subscribe();
 
-    const handleSync = () => {
-      setActiveSlots(
-        JSON.parse(localStorage.getItem('activeSlots')) || [
-          null,
-          null,
-          null,
-          null,
-        ],
-      );
-      setFinishedStudents(
-        JSON.parse(localStorage.getItem('finishedStudents')) || [],
-      );
-    };
-
-    window.addEventListener('storage', handleSync);
     return () => {
-      window.removeEventListener('storage', handleSync);
       supabase.removeChannel(channel);
     };
-  }, [fetchStudents]);
-
-  // 3. Simpan Perubahan ke LocalStorage (Tab lokal)
-  useEffect(() => {
-    localStorage.setItem('activeSlots', JSON.stringify(activeSlots));
-    localStorage.setItem('finishedStudents', JSON.stringify(finishedStudents));
-    localStorage.setItem('timerStates', JSON.stringify(timerStates));
-    localStorage.setItem('waitingList', JSON.stringify(waitingList));
-  }, [activeSlots, finishedStudents, timerStates, waitingList]);
+  }, [fetchActiveSlots, fetchStudents, fetchTimerLogs]);
 
   // --- Handlers ---
 
   const syncTimerState = async (id, state) => {
-    // Update State Lokal
     setTimerStates((prev) => ({ ...prev, [id]: state }));
-
-    // Kirim ke Supabase agar perangkat lain (Monitor) terupdate otomatis
     await supabase.from('timer_logs').upsert({
-      id: id,
+      id,
       is_running: state.isRunning,
       start_time: state.startTime,
       base_time: state.baseTime,
@@ -129,25 +118,20 @@ export default function App() {
     });
   };
 
-  const startFromQueue = (studentId) => {
-    if (isMonitorMode) return;
+  const startFromQueue = async (studentId) => {
     const emptyIdx = activeSlots.findIndex((s) => s === null);
     if (emptyIdx === -1) return alert('Slot Penuh!');
-
     const student = waitingList.find((s) => s.id === studentId);
-    const newActive = [...activeSlots];
-    newActive[emptyIdx] = student;
 
-    setActiveSlots(newActive);
-    setWaitingList(waitingList.filter((s) => s.id !== studentId));
-
-    // Status awal timer saat masuk slot
-    syncTimerState(student.id, {
+    await supabase
+      .from('active_slots')
+      .update({ student_id: student.id })
+      .eq('id', emptyIdx);
+    await syncTimerState(student.id, {
       isRunning: false,
       startTime: null,
       baseTime: DEFAULT_TIME,
     });
-    setSearchQuery('');
   };
 
   const handleFinish = async (student, remaining) => {
@@ -157,47 +141,35 @@ export default function App() {
         (a, b) => a.timeUsed - b.timeUsed,
       ),
     );
-    setActiveSlots(activeSlots.map((s) => (s?.id === student.id ? null : s)));
-
-    const newStates = { ...timerStates };
-    delete newStates[student.id];
-    setTimerStates(newStates);
-
-    // Hapus log dari Supabase setelah selesai
+    await supabase
+      .from('active_slots')
+      .update({ student_id: null })
+      .eq('student_id', student.id);
     await supabase.from('timer_logs').delete().eq('id', student.id);
   };
 
   const exportToPDF = () => {
-    if (finishedStudents.length === 0) return alert('Belum ada data.');
     const doc = new jsPDF();
     doc.text('LAPORAN UKK - SMK 2 MEI 87', 105, 15, { align: 'center' });
-    const rows = finishedStudents.map((s, i) => [
-      i + 1,
-      s.no_uji,
-      s.name,
-      Math.floor(s.timeUsed / 60) + 'm',
-      s.timeUsed > DEFAULT_TIME ? 'TELAT' : 'OK',
-    ]);
     autoTable(doc, {
       startY: 25,
-      head: [['No', 'No Ujian', 'Nama', 'Waktu', 'Status']],
-      body: rows,
+      head: [['No', 'No Ujian', 'Nama', 'Waktu']],
+      body: finishedStudents.map((s, i) => [
+        i + 1,
+        s.no_uji,
+        s.name,
+        Math.floor(s.timeUsed / 60) + 'm',
+      ]),
     });
     doc.save('Laporan_UKK.pdf');
   };
 
-  if (isLoading && waitingList.length === 0) {
+  if (isLoading && waitingList.length === 0)
     return (
       <div className="h-screen flex items-center justify-center bg-slate-900 text-white">
-        <div className="flex flex-col items-center gap-4">
-          <RefreshCw className="animate-spin text-indigo-500" size={48} />
-          <p className="font-black italic tracking-widest animate-pulse">
-            SYNCHRONIZING...
-          </p>
-        </div>
+        Loading...
       </div>
     );
-  }
 
   return (
     <div
@@ -210,34 +182,26 @@ export default function App() {
             alt="Logo"
             className="w-10 h-10 object-contain"
           />
-          <div>
-            <h1 className="text-lg font-black italic tracking-tighter leading-none text-slate-800 uppercase">
-              {isMonitorMode ? 'MONITORING' : 'ADMIN'} TIMER UKK
-            </h1>
-            <p className="text-[9px] font-bold text-slate-400 tracking-widest uppercase mt-1">
-              SMK 2 MEI 87 PRINGSEWU
-            </p>
-          </div>
+          <h1 className="text-lg font-black italic text-slate-800 uppercase leading-none">
+            {isMonitorMode ? 'MONITORING' : 'ADMIN'} TIMER UKK
+          </h1>
         </div>
-
         {!isMonitorMode && (
           <div className="flex gap-2">
             <button
-              onClick={fetchStudents}
-              className="p-3 bg-slate-50 text-slate-600 rounded-2xl border border-slate-200 hover:bg-indigo-50 hover:text-indigo-600 transition-colors"
+              onClick={() => {
+                fetchActiveSlots();
+                fetchStudents();
+              }}
+              className="p-3 bg-slate-50 text-slate-600 rounded-2xl border border-slate-200"
             >
               <RefreshCw size={18} />
             </button>
             <button
               onClick={() =>
-                window.open(
-                  window.location.origin +
-                    window.location.pathname +
-                    '?view=monitor',
-                  '_blank',
-                )
+                window.open(window.location.origin + '?view=monitor', '_blank')
               }
-              className="flex items-center gap-2 px-4 py-2 bg-amber-500 text-white rounded-2xl font-bold text-xs shadow-lg shadow-amber-100"
+              className="flex items-center gap-2 px-4 py-2 bg-amber-500 text-white rounded-2xl font-bold text-xs"
             >
               <Monitor size={16} /> MONITOR
             </button>
@@ -245,7 +209,7 @@ export default function App() {
               onClick={() => setShowSettings(true)}
               className="p-3 bg-slate-100 rounded-2xl border border-slate-200"
             >
-              <Settings size={20} className="text-slate-600" />
+              <Settings size={20} />
             </button>
           </div>
         )}
@@ -282,10 +246,8 @@ export default function App() {
           onClose={() => setShowSettings(false)}
           onExport={exportToPDF}
           onReset={() => {
-            if (confirm('Hapus semua data sesi?')) {
-              localStorage.clear();
-              window.location.reload();
-            }
+            localStorage.clear();
+            window.location.reload();
           }}
         />
       )}
