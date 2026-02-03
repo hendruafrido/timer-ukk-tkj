@@ -6,7 +6,7 @@ import autoTable from 'jspdf-autotable';
 import Sidebar from './components/Sidebar';
 import SettingsModal from './components/SettingsModal';
 import TimerCard from './components/TimerCard';
-import { supabase } from './lib/supabase'; // Pastikan file ini sudah ada
+import { supabase } from './lib/supabase';
 import { DEFAULT_TIME } from './data/students';
 
 export default function App() {
@@ -17,7 +17,6 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState('');
   const [isLoading, setIsLoading] = useState(true);
 
-  // State Utama
   const [waitingList, setWaitingList] = useState([]);
   const [activeSlots, setActiveSlots] = useState(
     () =>
@@ -35,7 +34,7 @@ export default function App() {
     () => JSON.parse(localStorage.getItem('timerStates')) || {},
   );
 
-  // 1. Fungsi Ambil Data dari Supabase
+  // 1. Ambil Data Siswa dari Supabase
   const fetchStudents = useCallback(async () => {
     try {
       setIsLoading(true);
@@ -46,7 +45,6 @@ export default function App() {
 
       if (error) throw error;
 
-      // Filter: Hanya tampilkan siswa yang tidak sedang aktif atau sudah selesai
       const activeIds = activeSlots.filter((s) => s !== null).map((s) => s.id);
       const finishedIds = finishedStudents.map((s) => s.id);
 
@@ -62,9 +60,29 @@ export default function App() {
     }
   }, [activeSlots, finishedStudents]);
 
-  // 2. Load data pertama kali & Sinkronisasi antar Tab
+  // 2. Sinkronisasi Real-time Antar Perangkat via Supabase
   useEffect(() => {
     fetchStudents();
+
+    // Berlangganan perubahan pada tabel timer_logs di Supabase
+    const channel = supabase
+      .channel('realtime-timer')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'timer_logs' },
+        (payload) => {
+          const { id, is_running, start_time, base_time } = payload.new;
+          setTimerStates((prev) => ({
+            ...prev,
+            [id]: {
+              isRunning: is_running,
+              startTime: start_time,
+              baseTime: base_time,
+            },
+          }));
+        },
+      )
+      .subscribe();
 
     const handleSync = () => {
       setActiveSlots(
@@ -78,14 +96,16 @@ export default function App() {
       setFinishedStudents(
         JSON.parse(localStorage.getItem('finishedStudents')) || [],
       );
-      setTimerStates(JSON.parse(localStorage.getItem('timerStates')) || {});
     };
 
     window.addEventListener('storage', handleSync);
-    return () => window.removeEventListener('storage', handleSync);
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    return () => {
+      window.removeEventListener('storage', handleSync);
+      supabase.removeChannel(channel);
+    };
+  }, [fetchStudents]);
 
-  // 3. Simpan Perubahan ke LocalStorage (Untuk Sinkronisasi Admin -> Monitor)
+  // 3. Simpan Perubahan ke LocalStorage (Tab lokal)
   useEffect(() => {
     localStorage.setItem('activeSlots', JSON.stringify(activeSlots));
     localStorage.setItem('finishedStudents', JSON.stringify(finishedStudents));
@@ -95,8 +115,18 @@ export default function App() {
 
   // --- Handlers ---
 
-  const syncTimerState = (id, state) => {
+  const syncTimerState = async (id, state) => {
+    // Update State Lokal
     setTimerStates((prev) => ({ ...prev, [id]: state }));
+
+    // Kirim ke Supabase agar perangkat lain (Monitor) terupdate otomatis
+    await supabase.from('timer_logs').upsert({
+      id: id,
+      is_running: state.isRunning,
+      start_time: state.startTime,
+      base_time: state.baseTime,
+      updated_at: new Date(),
+    });
   };
 
   const startFromQueue = (studentId) => {
@@ -110,6 +140,8 @@ export default function App() {
 
     setActiveSlots(newActive);
     setWaitingList(waitingList.filter((s) => s.id !== studentId));
+
+    // Status awal timer saat masuk slot
     syncTimerState(student.id, {
       isRunning: false,
       startTime: null,
@@ -118,7 +150,7 @@ export default function App() {
     setSearchQuery('');
   };
 
-  const handleFinish = (student, remaining) => {
+  const handleFinish = async (student, remaining) => {
     const used = DEFAULT_TIME - remaining;
     setFinishedStudents((prev) =>
       [...prev, { ...student, timeUsed: used }].sort(
@@ -126,9 +158,13 @@ export default function App() {
       ),
     );
     setActiveSlots(activeSlots.map((s) => (s?.id === student.id ? null : s)));
+
     const newStates = { ...timerStates };
     delete newStates[student.id];
     setTimerStates(newStates);
+
+    // Hapus log dari Supabase setelah selesai
+    await supabase.from('timer_logs').delete().eq('id', student.id);
   };
 
   const exportToPDF = () => {
@@ -156,7 +192,7 @@ export default function App() {
         <div className="flex flex-col items-center gap-4">
           <RefreshCw className="animate-spin text-indigo-500" size={48} />
           <p className="font-black italic tracking-widest animate-pulse">
-            SYNCHRONIZING SUPABASE...
+            SYNCHRONIZING...
           </p>
         </div>
       </div>
@@ -189,7 +225,6 @@ export default function App() {
             <button
               onClick={fetchStudents}
               className="p-3 bg-slate-50 text-slate-600 rounded-2xl border border-slate-200 hover:bg-indigo-50 hover:text-indigo-600 transition-colors"
-              title="Refresh Data"
             >
               <RefreshCw size={18} />
             </button>
@@ -247,11 +282,7 @@ export default function App() {
           onClose={() => setShowSettings(false)}
           onExport={exportToPDF}
           onReset={() => {
-            if (
-              confirm(
-                'Hapus semua data sesi? Data di Supabase tidak akan terhapus.',
-              )
-            ) {
+            if (confirm('Hapus semua data sesi?')) {
               localStorage.clear();
               window.location.reload();
             }
